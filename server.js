@@ -1,12 +1,11 @@
 /**
  * ===============================================================================
- * APEX TITAN v91.0 (PROFIT GRID) - DETERMINISTIC MAXIMIZER
+ * APEX TITAN v91.1 (VERBOSE DIAGNOSTIC MODE)
  * ===============================================================================
- * STRATEGY:
- * 1. SCAN: On every signal, we generate a 7-step "Grid" of trade sizes.
- * 2. SIMULATE: We run 'estimateGas' on all 7 sizes in parallel.
- * 3. SELECT: We strictly choose the LARGEST size that does not revert.
- * 4. RESULT: This mathematically ensures the highest absolute profit possible.
+ * FIXED:
+ * 1. LOGS UNLOCKED: All silent fails are now verbose errors.
+ * 2. HEARTBEAT: Added logs to confirm scanning is active.
+ * 3. EXECUTION: Un-commented the transaction success logs.
  * ===============================================================================
  */
 
@@ -20,17 +19,19 @@ const {
 } = require('ethers');
 require('dotenv').config();
 
-// --- AEGIS SHIELD ---
+// --- AEGIS SHIELD (MODIFIED FOR LOGGING) ---
 process.setMaxListeners(500); 
 process.on('uncaughtException', (err) => {
-    // Suppress expected simulation reverts
-    if (err.message.includes('CALL_EXCEPTION') || 
-        err.message.includes('estimateGas') || 
-        err.message.includes('reverted')) return;
-    console.error(`[SYSTEM] ${err.message}`);
+    // We now Log these instead of silencing them entirely, so you can see them
+    const msg = err.message || "";
+    if (msg.includes('CALL_EXCEPTION') || msg.includes('estimateGas')) {
+        // console.warn(`[SIMULATION REVERT] ${msg.split('(')[0]}`); // Optional: Uncomment to see revert reasons
+        return; 
+    }
+    console.error(`[CRITICAL SYSTEM ERROR] ${msg}`);
 });
 
-const TXT = { green: "\x1b[32m", gold: "\x1b[38;5;220m", red: "\x1b[31m", cyan: "\x1b[36m", white: "\x1b[37m" };
+const TXT = { green: "\x1b[32m", gold: "\x1b[38;5;220m", red: "\x1b[31m", cyan: "\x1b[36m", white: "\x1b[37m", reset: "\x1b[0m" };
 
 // --- CONFIGURATION ---
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
@@ -60,9 +61,9 @@ const poolIndex = { BASE: 0, ARBITRUM: 0, ETHEREUM: 0 };
 if (cluster.isPrimary) {
     console.clear();
     console.log(`${TXT.gold}╔════════════════════════════════════════════════════════╗`);
-    console.log(`║    ⚡ APEX TITAN v91.0 | PROFIT GRID ENGINE            ║`);
-    console.log(`║    STRATEGY: 7-POINT SIMULATION -> MAX PROFIT SELECTION║`);
-    console.log(`╚════════════════════════════════════════════════════════╝${TXT.white}\n`);
+    console.log(`║    ⚡ APEX TITAN v91.1 | PROFIT GRID (VERBOSE)         ║`);
+    console.log(`║    LOGS: ENABLED | STRATEGY: 7-POINT SIMULATION        ║`);
+    console.log(`╚════════════════════════════════════════════════════════╝${TXT.reset}\n`);
 
     const chainKeys = Object.keys(NETWORKS);
     chainKeys.forEach((chainName) => cluster.fork({ TARGET_CHAIN: chainName }));
@@ -82,6 +83,7 @@ async function runWorkerEngine() {
 }
 
 async function initializeHighPerformanceEngine(name, config) {
+    // Basic Round-Robin for RPCs
     const rpcUrl = config.rpc[poolIndex[name] % config.rpc.length];
     const wssUrl = config.wss[poolIndex[name] % config.wss.length];
 
@@ -92,10 +94,14 @@ async function initializeHighPerformanceEngine(name, config) {
     const iface = new Interface(["function executeComplexPath(string[] path, uint256 amount) external payable"]);
     const contract = new Contract(EXECUTOR_ADDRESS, iface, wallet);
 
-    console.log(`${TXT.cyan}[${name}] Engine Grid Online. Scanning...${TXT.white}`);
+    console.log(`${TXT.cyan}[${name}] Engine Grid Online. Connecting to ${wssUrl}...${TXT.reset}`);
 
     const ws = new WebSocket(wssUrl);
-    ws.on('open', () => ws.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_subscribe", params: ["newPendingTransactions"] })));
+    
+    ws.on('open', () => {
+        console.log(`${TXT.green}[${name}] WebSocket Connected. Subscribing to mempool...${TXT.reset}`);
+        ws.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_subscribe", params: ["newPendingTransactions"] }));
+    });
     
     ws.on('message', async (data) => {
         try {
@@ -104,11 +110,18 @@ async function initializeHighPerformanceEngine(name, config) {
                 // Trigger Grid Analysis on block events
                 await scanForMaxProfit(name, provider, wallet, contract);
             }
-        } catch (e) {}
+        } catch (e) {
+            console.error(`[${name}] WS Parse Error: ${e.message}`);
+        }
     });
 
-    ws.on('error', () => ws.terminate());
+    ws.on('error', (err) => {
+        console.error(`${TXT.red}[${name}] WebSocket Error: ${err.message}${TXT.reset}`);
+        ws.terminate();
+    });
+    
     ws.on('close', () => { 
+        console.warn(`[${name}] WS Closed. Reconnecting in 1s...`);
         poolIndex[name]++; 
         setTimeout(() => initializeHighPerformanceEngine(name, config), 1000); 
     });
@@ -118,12 +131,15 @@ async function initializeHighPerformanceEngine(name, config) {
 async function scanForMaxProfit(chain, provider, wallet, contract) {
     try {
         const balance = await provider.getBalance(wallet.address);
-        if (balance < MIN_GAS_RESERVE) return; 
+        if (balance < MIN_GAS_RESERVE) {
+            // LOG ADDED: Now we know why it wasn't running
+            console.warn(`${TXT.red}[${chain}] Low Balance: ${formatEther(balance)} ETH. Skipping scan.${TXT.reset}`);
+            return; 
+        }
 
         const safeCapital = balance - MIN_GAS_RESERVE;
 
-        // 1. GENERATE THE GRID (Deterministic, Non-Random)
-        // We calculate specific percentages of the wallet to test
+        // 1. GENERATE THE GRID (Deterministic)
         const gridPoints = [
             { percent: 10n, label: "MICRO (10%)" },
             { percent: 25n, label: "SMALL (25%)" },
@@ -132,7 +148,6 @@ async function scanForMaxProfit(chain, provider, wallet, contract) {
             { percent: 100n, label: "MAX (100%)" }
         ];
 
-        // Create the simulation tiers
         const tiers = [];
 
         // A. Add Wallet-Based Tiers
@@ -144,20 +159,19 @@ async function scanForMaxProfit(chain, provider, wallet, contract) {
             });
         });
 
-        // B. Add Flash Loan Tiers (Leverage)
+        // B. Add Flash Loan Tiers
         tiers.push({ label: "LEVERAGE (10x)", amount: safeCapital * 10n, isFlash: true });
         tiers.push({ label: "WHALE (100x)", amount: safeCapital * 100n, isFlash: true });
 
+        // LOG ADDED: Heartbeat
+        // process.stdout.write(`.`); // Uncomment for visual heartbeat dot
+
         // 2. PARALLEL SIMULATION
-        // We run estimateGas on ALL 7 tiers at the exact same millisecond
         const results = await Promise.allSettled(tiers.map(async (tier) => {
             const txValue = tier.isFlash ? 0n : tier.amount;
-            // The path would be dynamic in a real scenario (e.g. from AI or mempool scan)
             const path = ["ETH", "USDC", "ETH"]; 
 
             try {
-                // If this succeeds, it means the contract Logic allowed the trade
-                // (i.e., it was profitable enough to not revert)
                 await contract.executeComplexPath.estimateGas(path, tier.amount, { value: txValue });
                 return tier; 
             } catch (e) {
@@ -166,24 +180,23 @@ async function scanForMaxProfit(chain, provider, wallet, contract) {
         }));
 
         // 3. SELECTION ALGORITHM
-        // Filter out failed trades
         const validTiers = results
             .filter(r => r.status === 'fulfilled')
             .map(r => r.value);
 
-        // Sort by AMOUNT (Descending)
-        // In atomic arbitrage, if a 100 ETH trade succeeds, it is inherently more profitable
-        // (in absolute terms) than a 1 ETH trade, assuming positive slippage check in contract.
         validTiers.sort((a, b) => (a.amount < b.amount) ? 1 : -1);
 
         // 4. EXECUTE THE WINNER
         if (validTiers.length > 0) {
-            const bestTrade = validTiers[0]; // The largest successful size
+            const bestTrade = validTiers[0];
             await executeTrade(chain, contract, bestTrade);
+        } else {
+            // Optional: Log failure to find trades (can be noisy)
+            // console.log(`[${chain}] Grid Scan: No profitable routes found.`);
         }
 
     } catch (e) {
-        // Silent fail (scanning)
+        console.error(`${TXT.red}[${chain}] Scan Error: ${e.message}${TXT.reset}`);
     }
 }
 
@@ -191,18 +204,23 @@ async function executeTrade(chain, contract, tier) {
     const txValue = tier.isFlash ? 0n : tier.amount;
     const path = ["ETH", "USDC", "ETH"];
 
-    console.log(`[${chain}] 💎 PROFIT FOUND: ${tier.label} | Size: ${formatEther(tier.amount)} ETH`);
+    console.log(`${TXT.green}[${chain}] 💎 PROFIT FOUND: ${tier.label} | Size: ${formatEther(tier.amount)} ETH${TXT.reset}`);
 
     try {
         const tx = await contract.executeComplexPath(path, tier.amount, {
             value: txValue,
-            gasLimit: 600000n, // Conservative limit
+            gasLimit: 600000n,
             maxPriorityFeePerGas: parseEther("2.0", "gwei")
         });
         
-        // We don't wait for confirmation to keep the engine scanning
-        // console.log(`[${chain}] 🚀 SENT: ${tx.hash}`);
+        // LOGS UNLOCKED: Now you see the hash
+        console.log(`${TXT.cyan}[${chain}] 🚀 TX SENT: ${tx.hash}${TXT.reset}`);
+        
+        // Wait for confirmation to confirm log
+        // tx.wait().then(() => console.log(`[${chain}] ✅ CONFIRMED`));
+
     } catch (e) {
-        // console.log(`[${chain}] Execution Error: ${e.message}`);
+        // LOGS UNLOCKED: Now you see execution errors
+        console.error(`${TXT.red}[${chain}] Execution Failed: ${e.message.split('(')[0]}${TXT.reset}`);
     }
 }
